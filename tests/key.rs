@@ -1,0 +1,247 @@
+use prompt_cache_key::{
+    canonical_json, compute_cache_key, find_breakpoints, scope_blocks, System, KEY_PREFIX,
+};
+use serde_json::{json, Value};
+
+// ---- find_breakpoints --------------------------------------------------
+
+#[test]
+fn find_breakpoints_empty() {
+    assert_eq!(find_breakpoints(&json!([])), Vec::<usize>::new());
+    assert_eq!(find_breakpoints(&Value::Null), Vec::<usize>::new());
+}
+
+#[test]
+fn find_breakpoints_no_markers() {
+    let blocks = json!([
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b"},
+    ]);
+    assert_eq!(find_breakpoints(&blocks), Vec::<usize>::new());
+}
+
+#[test]
+fn find_breakpoints_single_marker() {
+    let blocks = json!([
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "c"},
+    ]);
+    assert_eq!(find_breakpoints(&blocks), vec![1]);
+}
+
+#[test]
+fn find_breakpoints_multiple_markers() {
+    let blocks = json!([
+        {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "b"},
+        {"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}},
+    ]);
+    assert_eq!(find_breakpoints(&blocks), vec![0, 2]);
+}
+
+#[test]
+fn find_breakpoints_null_cache_control_skipped() {
+    let blocks = json!([
+        {"type": "text", "text": "a", "cache_control": null},
+        {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+    ]);
+    assert_eq!(find_breakpoints(&blocks), vec![1]);
+}
+
+// ---- scope_blocks ------------------------------------------------------
+
+#[test]
+fn scope_blocks_includes_through_last_breakpoint() {
+    let blocks = json!([
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "c"},
+        {"type": "text", "text": "d", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "e"},
+    ]);
+    let out = scope_blocks(&blocks);
+    let texts: Vec<&str> = out
+        .iter()
+        .map(|b| b["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn scope_blocks_no_breakpoint_returns_all() {
+    let blocks = json!([
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b"},
+    ]);
+    let out = scope_blocks(&blocks);
+    let texts: Vec<&str> = out
+        .iter()
+        .map(|b| b["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, vec!["a", "b"]);
+}
+
+#[test]
+fn scope_blocks_empty_returns_empty() {
+    assert!(scope_blocks(&json!([])).is_empty());
+    assert!(scope_blocks(&Value::Null).is_empty());
+}
+
+// ---- compute_cache_key -------------------------------------------------
+
+#[test]
+fn compute_key_returns_prefixed_hex() {
+    let key = compute_cache_key("claude-opus-4-7", System::Text("You are helpful."), None);
+    assert!(key.starts_with(&format!("{KEY_PREFIX}:claude-opus-4-7:sha256:")));
+    let hex_part = key.rsplit(':').next().unwrap();
+    assert_eq!(hex_part.len(), 64);
+    assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn compute_key_stable() {
+    let a = compute_cache_key("claude-opus-4-7", System::Text("x"), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Text("x"), None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_changes_with_model() {
+    let a = compute_cache_key("claude-opus-4-7", System::Text("x"), None);
+    let b = compute_cache_key("claude-sonnet-4-6", System::Text("x"), None);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn compute_key_changes_with_system() {
+    let a = compute_cache_key("claude-opus-4-7", System::Text("x"), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Text("y"), None);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn compute_key_changes_with_tools() {
+    let tools = json!([{"name": "search", "description": "d", "input_schema": {}}]);
+    let a = compute_cache_key("claude-opus-4-7", System::Text("x"), Some(&tools));
+    let b = compute_cache_key("claude-opus-4-7", System::Text("x"), Some(&json!([])));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn compute_key_string_system_equals_single_text_block() {
+    let a = compute_cache_key("claude-opus-4-7", System::Text("hello"), None);
+    let blocks = json!([{"type": "text", "text": "hello"}]);
+    let b = compute_cache_key("claude-opus-4-7", System::Blocks(&blocks), None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_ignores_content_after_last_breakpoint() {
+    let base = json!([
+        {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "EXTRA-1"},
+    ]);
+    let other = json!([
+        {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "DIFFERENT"},
+    ]);
+    let a = compute_cache_key("claude-opus-4-7", System::Blocks(&base), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Blocks(&other), None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_includes_content_before_and_at_breakpoint() {
+    let a_blocks = json!([
+        {"type": "text", "text": "stable-a", "cache_control": {"type": "ephemeral"}},
+    ]);
+    let b_blocks = json!([
+        {"type": "text", "text": "stable-b", "cache_control": {"type": "ephemeral"}},
+    ]);
+    let a = compute_cache_key("claude-opus-4-7", System::Blocks(&a_blocks), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Blocks(&b_blocks), None);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn compute_key_none_system_works() {
+    let key = compute_cache_key("claude-opus-4-7", System::None, None);
+    assert!(key.starts_with(&format!("{KEY_PREFIX}:claude-opus-4-7:sha256:")));
+}
+
+#[test]
+fn compute_key_tools_order_matters() {
+    let t1 = json!([{"name": "a", "description": "", "input_schema": {}}]);
+    let t2 = json!([
+        {"name": "a", "description": "", "input_schema": {}},
+        {"name": "b", "description": "", "input_schema": {}},
+    ]);
+    let a = compute_cache_key("claude-opus-4-7", System::None, Some(&t1));
+    let b = compute_cache_key("claude-opus-4-7", System::None, Some(&t2));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn compute_key_no_breakpoint_includes_full_system() {
+    let a = compute_cache_key("claude-opus-4-7", System::Text("full prompt A"), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Text("full prompt B"), None);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn key_prefix_constant() {
+    assert_eq!(KEY_PREFIX, "anthropic-cache");
+}
+
+// ---- canonical_json ----------------------------------------------------
+
+#[test]
+fn canonical_json_sorts_keys_recursively() {
+    let a = canonical_json(&json!({"b": 1, "a": 2}));
+    let b = canonical_json(&json!({"a": 2, "b": 1}));
+    assert_eq!(a, b);
+    assert_eq!(a, r#"{"a":2,"b":1}"#);
+}
+
+#[test]
+fn canonical_json_nested_objects_sorted() {
+    let v = json!({"outer": {"z": 1, "a": 2}, "first": [{"y": 1, "x": 2}]});
+    let out = canonical_json(&v);
+    assert_eq!(out, r#"{"first":[{"x":2,"y":1}],"outer":{"a":2,"z":1}}"#);
+}
+
+#[test]
+fn canonical_json_unicode_passes_through() {
+    let v = json!({"hello": "héllo"});
+    let out = canonical_json(&v);
+    assert!(out.contains("héllo"));
+}
+
+#[test]
+fn canonical_json_escapes_control_chars() {
+    let v = json!({"k": "a\nb\tc"});
+    let out = canonical_json(&v);
+    assert_eq!(out, r#"{"k":"a\nb\tc"}"#);
+}
+
+#[test]
+fn compute_key_order_independent_in_objects() {
+    // semantically identical tool definitions hash to the same key
+    let t1 = json!([{"name": "a", "description": "x", "input_schema": {}}]);
+    let t2 = json!([{"description": "x", "input_schema": {}, "name": "a"}]);
+    let a = compute_cache_key("claude-opus-4-7", System::None, Some(&t1));
+    let b = compute_cache_key("claude-opus-4-7", System::None, Some(&t2));
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_known_digest() {
+    // Lock down a known-good digest so future refactors do not silently
+    // shift the canonicalization scheme.
+    let key = compute_cache_key("claude-opus-4-7", System::Text("hi"), None);
+    assert_eq!(
+        key,
+        "anthropic-cache:claude-opus-4-7:sha256:05061cc26d0f9b68927bd818199f650bba1c36710ca18adcc4faa8a4d6dc1646"
+    );
+}
