@@ -61,10 +61,7 @@ fn scope_blocks_includes_through_last_breakpoint() {
         {"type": "text", "text": "e"},
     ]);
     let out = scope_blocks(&blocks);
-    let texts: Vec<&str> = out
-        .iter()
-        .map(|b| b["text"].as_str().unwrap())
-        .collect();
+    let texts: Vec<&str> = out.iter().map(|b| b["text"].as_str().unwrap()).collect();
     assert_eq!(texts, vec!["a", "b", "c", "d"]);
 }
 
@@ -75,10 +72,7 @@ fn scope_blocks_no_breakpoint_returns_all() {
         {"type": "text", "text": "b"},
     ]);
     let out = scope_blocks(&blocks);
-    let texts: Vec<&str> = out
-        .iter()
-        .map(|b| b["text"].as_str().unwrap())
-        .collect();
+    let texts: Vec<&str> = out.iter().map(|b| b["text"].as_str().unwrap()).collect();
     assert_eq!(texts, vec!["a", "b"]);
 }
 

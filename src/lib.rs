@@ -1,126 +1,162 @@
 /*!
 prompt-cache-key: stable Anthropic prompt cache-scope hashes.
 
-Hash the scope-clipped system prompt, tool list, and model to produce a
-stable key that identifies which Anthropic prompt cache bucket a request
-will hit. Distinct from `llm-message-hash` which hashes the full request
-including user messages.
+Anthropic's prompt cache hits when the prefix (system plus tools, up to a
+`cache_control` breakpoint) is byte-identical to a previously seen request.
+This crate produces a deterministic key from `(model, system, tools)` that
+survives benign reordering of JSON keys. Distinct from `llm-message-hash`
+which hashes the full request including user messages.
 
 ```rust
-use prompt_cache_key::{CacheKey, HashOpts};
+use prompt_cache_key::{compute_cache_key, System};
 use serde_json::json;
 
-let system = json!("You are a helpful assistant.");
-let tools: Vec<serde_json::Value> = vec![];
-let key = CacheKey::compute("claude-sonnet-4-6", &system, &tools, HashOpts::default());
-assert_eq!(key.hex.len(), 64);
+let key = compute_cache_key(
+    "claude-opus-4-7",
+    System::Text("You are helpful."),
+    Some(&json!([
+        {"name": "search", "description": "", "input_schema": {}},
+    ])),
+);
+assert!(key.starts_with("anthropic-cache:claude-opus-4-7:sha256:"));
+```
+
+When `system` contains a `cache_control` marker, anything after the last
+marker is excluded from the key, matching Anthropic's cached prefix.
+
+```rust
+use prompt_cache_key::{compute_cache_key, System};
+use serde_json::json;
+
+let blocks = json!([
+    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "this changes per request"},
+]);
+let key = compute_cache_key("claude-opus-4-7", System::Blocks(&blocks), None);
+assert!(key.starts_with("anthropic-cache:claude-opus-4-7:sha256:"));
 ```
 */
 
-use sha2::{Digest, Sha256};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+/// Prefix that every computed cache key starts with.
+pub const KEY_PREFIX: &str = "anthropic-cache";
+
+/// The system prompt for a request, in any of the forms the Anthropic API accepts.
+#[derive(Debug, Clone, Copy)]
+pub enum System<'a> {
+    /// No system prompt.
+    None,
+    /// A plain-string system prompt. Treated as a single text block.
+    Text(&'a str),
+    /// A JSON array of content blocks, possibly carrying `cache_control` markers.
+    Blocks(&'a Value),
+}
 
 // ---- canonical JSON ---------------------------------------------------
 
-fn canonical(value: &Value) -> Value {
+/// Recursively sort object keys so semantically identical JSON produces an
+/// identical `Value`.
+fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(m) => {
             let sorted: BTreeMap<&String, &Value> = m.iter().collect();
-            let out: Map<String, Value> =
-                sorted.into_iter().map(|(k, v)| (k.clone(), canonical(v))).collect();
-            Value::Object(out)
-        }
-        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
-        other => other.clone(),
-    }
-}
-
-fn sha256_hex(data: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(data.as_bytes());
-    format!("{:x}", h.finalize())
-}
-
-// ---- drop fields -------------------------------------------------------
-
-/// Options for computing the cache key.
-#[derive(Debug, Clone, Default)]
-pub struct HashOpts {
-    /// Extra field names to strip from every object before hashing.
-    pub drop_fields: Vec<String>,
-}
-
-fn drop_object_fields(value: &Value, drop: &[String]) -> Value {
-    match value {
-        Value::Object(m) => {
-            let out: Map<String, Value> = m
-                .iter()
-                .filter(|(k, _)| !drop.contains(k))
-                .map(|(k, v)| (k.clone(), drop_object_fields(v, drop)))
+            let out: Map<String, Value> = sorted
+                .into_iter()
+                .map(|(k, v)| (k.clone(), canonicalize(v)))
                 .collect();
             Value::Object(out)
         }
-        Value::Array(a) => Value::Array(a.iter().map(|v| drop_object_fields(v, drop)).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(canonicalize).collect()),
         other => other.clone(),
     }
 }
 
-// ---- CacheKey ---------------------------------------------------------
-
-/// A computed cache key for an Anthropic prompt cache scope.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheKey {
-    /// Lowercase hex SHA-256 of the canonical scope payload.
-    pub hex: String,
-    /// The model that was hashed.
-    pub model: String,
+/// Serialize a JSON value to a canonical, compact string with all object keys
+/// sorted recursively.
+///
+/// This makes hashing insensitive to benign key reordering. Control characters
+/// are escaped exactly as in standard JSON, and non-ASCII characters pass
+/// through unescaped.
+pub fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(&canonicalize(value)).unwrap_or_default()
 }
 
-impl CacheKey {
-    /// Compute the cache key from model + system + tools.
-    ///
-    /// The system prompt and tool list are canonicalized (keys sorted
-    /// recursively), optional fields stripped, then serialized to compact JSON
-    /// and hashed together with the model name.
-    pub fn compute(model: &str, system: &Value, tools: &[Value], opts: HashOpts) -> Self {
-        let sys_clean = drop_object_fields(system, &opts.drop_fields);
-        let sys_canon = canonical(&sys_clean);
+// ---- breakpoints / scope ----------------------------------------------
 
-        let tools_clean: Vec<Value> = tools
+/// Return the indices of blocks that carry a non-null `cache_control` marker.
+///
+/// A non-array (or `null`) input yields an empty list.
+pub fn find_breakpoints(blocks: &Value) -> Vec<usize> {
+    match blocks {
+        Value::Array(arr) => arr
             .iter()
-            .map(|t| drop_object_fields(t, &opts.drop_fields))
-            .collect();
-        let tools_canon = canonical(&Value::Array(tools_clean));
+            .enumerate()
+            .filter_map(|(i, block)| match block.get("cache_control") {
+                Some(cc) if !cc.is_null() => Some(i),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
-        let payload = format!(
-            "model={}\nsystem={}\ntools={}",
-            model,
-            serde_json::to_string(&sys_canon).unwrap_or_default(),
-            serde_json::to_string(&tools_canon).unwrap_or_default(),
-        );
-
-        CacheKey {
-            hex: sha256_hex(&payload),
-            model: model.to_owned(),
+/// Return the cache-scoped prefix of `blocks`: everything up to and including
+/// the last `cache_control` breakpoint.
+///
+/// If there is no breakpoint, every block is returned (the whole system is part
+/// of the cache scope). A non-array (or `null`) input yields an empty vector.
+pub fn scope_blocks(blocks: &Value) -> Vec<Value> {
+    match blocks {
+        Value::Array(arr) => {
+            let breakpoints = find_breakpoints(blocks);
+            let end = match breakpoints.last() {
+                Some(&last) => last + 1,
+                None => arr.len(),
+            };
+            arr[..end].to_vec()
         }
-    }
-
-    /// Compute from a raw string system prompt (no JSON canonicalization).
-    pub fn compute_str(model: &str, system: &str, tools: &[Value], opts: HashOpts) -> Self {
-        Self::compute(model, &Value::String(system.to_owned()), tools, opts)
+        _ => Vec::new(),
     }
 }
 
-impl std::fmt::Display for CacheKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.hex)
+// ---- key computation --------------------------------------------------
+
+/// Normalize a [`System`] into the list of content blocks that fall inside the
+/// cache scope.
+fn system_scope_blocks(system: System<'_>) -> Vec<Value> {
+    match system {
+        System::None => Vec::new(),
+        System::Text(text) => vec![serde_json::json!({"type": "text", "text": text})],
+        System::Blocks(blocks) => scope_blocks(blocks),
     }
 }
 
-/// Compute a cache key and return just the hex string.
-pub fn cache_key(model: &str, system: &Value, tools: &[Value]) -> String {
-    CacheKey::compute(model, system, tools, HashOpts::default()).hex
+/// Compute a stable cache-scope key for a request.
+///
+/// The key is `anthropic-cache:<model>:sha256:<hex>`, where the hex is the
+/// SHA-256 of the canonical JSON of `{model, system, tools}`. The `system`
+/// payload is the cache-scoped prefix of the system blocks (a string system is
+/// treated as a single text block), and `tools` defaults to an empty array when
+/// `None`.
+pub fn compute_cache_key(model: &str, system: System<'_>, tools: Option<&Value>) -> String {
+    let scoped = system_scope_blocks(system);
+    let tools_value = tools.cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+
+    let payload = serde_json::json!({
+        "model": model,
+        "system": scoped,
+        "tools": tools_value,
+    });
+
+    let canon = canonical_json(&payload);
+    let mut hasher = Sha256::new();
+    hasher.update(canon.as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+
+    format!("{KEY_PREFIX}:{model}:sha256:{hex}")
 }
 
 #[cfg(test)]
@@ -129,115 +165,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn hex_is_64_chars() {
-        let k = CacheKey::compute("model", &json!("system"), &[], HashOpts::default());
-        assert_eq!(k.hex.len(), 64);
+    fn key_prefix_is_anthropic_cache() {
+        assert_eq!(KEY_PREFIX, "anthropic-cache");
     }
 
     #[test]
-    fn same_inputs_same_key() {
-        let a = CacheKey::compute("model", &json!("sys"), &[], HashOpts::default());
-        let b = CacheKey::compute("model", &json!("sys"), &[], HashOpts::default());
-        assert_eq!(a, b);
+    fn none_system_produces_valid_key() {
+        let k = compute_cache_key("m", System::None, None);
+        assert!(k.starts_with("anthropic-cache:m:sha256:"));
+        assert_eq!(k.rsplit(':').next().unwrap().len(), 64);
     }
 
     #[test]
-    fn different_model_different_key() {
-        let a = CacheKey::compute("model-a", &json!("sys"), &[], HashOpts::default());
-        let b = CacheKey::compute("model-b", &json!("sys"), &[], HashOpts::default());
-        assert_ne!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn different_system_different_key() {
-        let a = CacheKey::compute("model", &json!("sys1"), &[], HashOpts::default());
-        let b = CacheKey::compute("model", &json!("sys2"), &[], HashOpts::default());
-        assert_ne!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn key_order_independent() {
-        let sys_a = json!({"b": 2, "a": 1});
-        let sys_b = json!({"a": 1, "b": 2});
-        let a = CacheKey::compute("model", &sys_a, &[], HashOpts::default());
-        let b = CacheKey::compute("model", &sys_b, &[], HashOpts::default());
-        assert_eq!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn tools_order_matters() {
-        let t1 = json!({"name": "tool_a"});
-        let t2 = json!({"name": "tool_b"});
-        let a = CacheKey::compute("model", &json!("sys"), &[t1.clone(), t2.clone()], HashOpts::default());
-        let b = CacheKey::compute("model", &json!("sys"), &[t2.clone(), t1.clone()], HashOpts::default());
-        assert_ne!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn drop_fields_excluded() {
-        let sys_with = json!({"text": "hello", "cache_control": {"type": "ephemeral"}});
-        let sys_without = json!({"text": "hello"});
-        let opts = HashOpts { drop_fields: vec!["cache_control".to_string()] };
-        let a = CacheKey::compute("model", &sys_with, &[], opts);
-        let b = CacheKey::compute("model", &sys_without, &[], HashOpts::default());
-        assert_eq!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn compute_str_matches_json_string() {
-        let a = CacheKey::compute_str("model", "hello", &[], HashOpts::default());
-        let b = CacheKey::compute("model", &json!("hello"), &[], HashOpts::default());
-        assert_eq!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn model_stored() {
-        let k = CacheKey::compute("my-model", &json!("s"), &[], HashOpts::default());
-        assert_eq!(k.model, "my-model");
-    }
-
-    #[test]
-    fn display_is_hex() {
-        let k = CacheKey::compute("m", &json!("s"), &[], HashOpts::default());
-        assert_eq!(k.to_string(), k.hex);
-    }
-
-    #[test]
-    fn cache_key_fn_wrapper() {
-        let hex = cache_key("m", &json!("s"), &[]);
-        assert_eq!(hex.len(), 64);
-    }
-
-    #[test]
-    fn tools_affect_key() {
-        let a = CacheKey::compute("model", &json!("sys"), &[], HashOpts::default());
-        let b = CacheKey::compute("model", &json!("sys"), &[json!({"name": "t"})], HashOpts::default());
-        assert_ne!(a.hex, b.hex);
-    }
-
-    #[test]
-    fn nested_key_order_independent() {
-        let a = json!({"outer": {"b": 2, "a": 1}});
-        let b = json!({"outer": {"a": 1, "b": 2}});
-        let ka = CacheKey::compute("m", &a, &[], HashOpts::default());
-        let kb = CacheKey::compute("m", &b, &[], HashOpts::default());
-        assert_eq!(ka.hex, kb.hex);
-    }
-
-    #[test]
-    fn empty_system_and_tools() {
-        let k = CacheKey::compute("model", &json!(null), &[], HashOpts::default());
-        assert_eq!(k.hex.len(), 64);
-    }
-
-    #[test]
-    fn all_models_produce_different_keys() {
-        let models = ["claude-opus-4-7", "claude-sonnet-4-6", "gpt-4o", "gemini-2.5-pro"];
-        let keys: Vec<String> = models
-            .iter()
-            .map(|m| CacheKey::compute(m, &json!("sys"), &[], HashOpts::default()).hex)
-            .collect();
-        let unique: std::collections::HashSet<_> = keys.iter().collect();
-        assert_eq!(unique.len(), models.len());
+    fn scope_blocks_handles_non_array() {
+        assert!(scope_blocks(&json!("not an array")).is_empty());
+        assert!(scope_blocks(&json!(42)).is_empty());
     }
 }
