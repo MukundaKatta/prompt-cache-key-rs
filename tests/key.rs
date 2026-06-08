@@ -239,3 +239,100 @@ fn compute_key_known_digest() {
         "anthropic-cache:claude-opus-4-7:sha256:05061cc26d0f9b68927bd818199f650bba1c36710ca18adcc4faa8a4d6dc1646"
     );
 }
+
+// ---- invariants around the tools and system arguments ------------------
+
+#[test]
+fn compute_key_none_tools_equals_empty_array_tools() {
+    // `tools: None` defaults to an empty array, so it must hash identically
+    // to an explicitly-empty tools list.
+    let a = compute_cache_key("claude-opus-4-7", System::Text("x"), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Text("x"), Some(&json!([])));
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_blocks_non_array_behaves_like_none() {
+    // A `System::Blocks` carrying a non-array value contributes no scoped
+    // blocks, so it must match an empty `System::None`.
+    let scalar = json!("not an array");
+    let a = compute_cache_key("claude-opus-4-7", System::Blocks(&scalar), None);
+    let b = compute_cache_key("claude-opus-4-7", System::None, None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_blocks_null_behaves_like_none() {
+    let null = Value::Null;
+    let a = compute_cache_key("claude-opus-4-7", System::Blocks(&null), None);
+    let b = compute_cache_key("claude-opus-4-7", System::None, None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn scope_blocks_non_array_inputs_are_empty() {
+    assert!(scope_blocks(&json!({"a": 1})).is_empty());
+    assert!(scope_blocks(&json!("string")).is_empty());
+    assert!(scope_blocks(&json!(42)).is_empty());
+    assert!(scope_blocks(&json!(true)).is_empty());
+}
+
+#[test]
+fn find_breakpoints_non_array_inputs_are_empty() {
+    assert!(find_breakpoints(&json!({"cache_control": {"type": "ephemeral"}})).is_empty());
+    assert!(find_breakpoints(&json!("string")).is_empty());
+    assert!(find_breakpoints(&json!(0)).is_empty());
+}
+
+#[test]
+fn compute_key_tool_field_order_does_not_matter() {
+    // Reordering the keys inside a single tool object must not change the key,
+    // because the whole payload is canonicalized before hashing.
+    let t1 = json!([{
+        "name": "search",
+        "description": "look things up",
+        "input_schema": {"type": "object", "properties": {}}
+    }]);
+    let t2 = json!([{
+        "input_schema": {"properties": {}, "type": "object"},
+        "description": "look things up",
+        "name": "search"
+    }]);
+    let a = compute_cache_key("claude-opus-4-7", System::None, Some(&t1));
+    let b = compute_cache_key("claude-opus-4-7", System::None, Some(&t2));
+    assert_eq!(a, b);
+}
+
+#[test]
+fn compute_key_extra_cache_control_marker_does_not_affect_scoped_prefix() {
+    // Adding a trailing block beyond the last breakpoint must not change the
+    // key, even when that trailing block itself differs structurally.
+    let a_blocks = json!([
+        {"type": "text", "text": "shared", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "tail-a"},
+    ]);
+    let b_blocks = json!([
+        {"type": "text", "text": "shared", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "tail-b", "extra_field": 123},
+    ]);
+    let a = compute_cache_key("claude-opus-4-7", System::Blocks(&a_blocks), None);
+    let b = compute_cache_key("claude-opus-4-7", System::Blocks(&b_blocks), None);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn canonical_json_top_level_scalar_round_trips() {
+    assert_eq!(canonical_json(&json!(42)), "42");
+    assert_eq!(canonical_json(&json!("s")), r#""s""#);
+    assert_eq!(canonical_json(&Value::Null), "null");
+    assert_eq!(canonical_json(&json!([3, 2, 1])), "[3,2,1]");
+}
+
+#[test]
+fn canonical_json_preserves_array_order() {
+    // Arrays are ordered data; canonicalization must not reorder them.
+    let a = canonical_json(&json!([3, 1, 2]));
+    let b = canonical_json(&json!([1, 2, 3]));
+    assert_ne!(a, b);
+    assert_eq!(a, "[3,1,2]");
+}
